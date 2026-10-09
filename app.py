@@ -10,18 +10,78 @@ from PIL import Image
 app = Flask(__name__)
 
 # API Configurations
-RC_API_URL = "https://vahanapi.vk177384.workers.dev/"
+RC_API_URL = "https://leakinfo.pro/api/vehicle_v3.php"
+RC_API_KEY = "DARKe966dd66"
 IMG_API_URL = "https://www.allimagetools.com/api/html-to-image"
 TEMPLATE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "template.html")
 
 
+def _rc_field(info: dict, key: str) -> str:
+    """Read a vehicle_info field as a clean string (new API can send null)."""
+    value = info.get(key)
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _state_from_registered_at(registered_at: str) -> str:
+    """'BHAVNAGAR, Gujarat' -> 'Gujarat'"""
+    if not registered_at:
+        return "India"
+    parts = registered_at.split(",")
+    state = parts[-1].strip() if len(parts) > 1 else registered_at.strip()
+    return state or "India"
+
+
 def fetch_rc_data(vehicle_no: str) -> dict:
-    resp = requests.get(RC_API_URL, params={"vehicle_no": vehicle_no}, timeout=30)
-    resp.raise_for_status()
-    data = resp.json()
-    if data.get("statusCode") != 200 or "response" not in data:
+    """Fetch from leakinfo.pro and normalise it into the shape build_html() expects."""
+    resp = requests.get(
+        RC_API_URL,
+        params={"key": RC_API_KEY, "vehicle": vehicle_no},
+        timeout=30,
+    )
+    # 400 (malformed number) and 404 (unknown number) both mean "no data".
+    # Anything else (401 bad key, 5xx) is a real API failure.
+    if resp.status_code in (400, 404):
         raise ValueError(f"No data found or API error for vehicle {vehicle_no!r}")
-    return data["response"]
+    resp.raise_for_status()
+
+    try:
+        payload = resp.json()
+    except ValueError:
+        # API sometimes answers 200 with an empty body for unknown vehicles
+        raise ValueError(f"No data found or API error for vehicle {vehicle_no!r}")
+
+    if not isinstance(payload, dict) or not payload.get("success"):
+        raise ValueError(f"No data found or API error for vehicle {vehicle_no!r}")
+
+    info = (payload.get("data") or {}).get("vehicle_info") or {}
+    if not info:
+        raise ValueError(f"No data found or API error for vehicle {vehicle_no!r}")
+
+    registered_at = _rc_field(info, "registered_at")
+
+    return {
+        "regNo":                 _rc_field(info, "registration_number"),
+        "regDate":               _rc_field(info, "registration_date"),
+        "insuranceUpto":         _rc_field(info, "previous_policy_valid_upto"),
+        "chassis":               _rc_field(info, "chassis_number"),
+        "engine":                _rc_field(info, "engine_number"),
+        "owner":                 _rc_field(info, "owner_name"),
+        # ownerFatherName / unladenWeight are NOT provided by the new API,
+        # so the existing defaults in build_html() apply.
+        "presentAddress":        _rc_field(info, "correspondence_address"),
+        "permAddress":           _rc_field(info, "permanent_address"),
+        "fuelType":              _rc_field(info, "fuel_type"),
+        "vehicleClass":          _rc_field(info, "class_category"),
+        "manufacturer":          _rc_field(info, "make"),
+        "vehicle":               _rc_field(info, "model"),
+        "seatCapacity":          _rc_field(info, "seat_capacity"),
+        "cubicCapacity":         _rc_field(info, "cubic_capacity"),
+        "manufacturerMonthYear": _rc_field(info, "manufacturing_month_year"),
+        "regAuthority":          registered_at,
+        "rtoData":               {"statename": _state_from_registered_at(registered_at)},
+    }
 
 
 def mfg_month_year(raw: str) -> str:
@@ -172,12 +232,12 @@ def build_html(data: dict) -> str:
                         f">Card Issue Date ({issue_date})<")
 
     html = re.sub(
-        r'(Seating in all Capacity</div>.*?ff1.*?>)2(<)',
+        r'(Seating \(in all\) Capacity</div>.*?ff1.*?>)2(<)',
         lambda m: m.group(1) + seat_cap + m.group(2),
         html, flags=re.DOTALL
     )
     html = re.sub(
-        r'(Unladen Weight Kg</div>.*?ff1.*?>)110(<)',
+        r'(Unladen Weight \(Kg\)</div>.*?ff1.*?>)110(<)',
         lambda m: m.group(1) + unld_wt + m.group(2),
         html, flags=re.DOTALL
     )
